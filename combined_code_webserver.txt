@@ -1,0 +1,401 @@
+// FlashControllerApi.cs
+using Windows.Devices.Enumeration;
+using Windows.Media.Capture;
+using Windows.Media.MediaProperties;
+using Windows.Storage;
+using Windows.Storage.Streams;
+using Windows.System;
+
+namespace CameraFlashWebAppServer
+{
+    public class FlashControllerApi
+    {
+        private MediaCapture _mediaCapture;
+        private ILogger _logger;
+
+        public void Initialize(ILogger logger)
+        {
+            _logger = logger;
+        }
+
+        public async Task<bool> InitializeAsync(CameraType cameraType)
+        {
+            try
+            {
+                if (_mediaCapture == null)
+                {
+                    _logger.LogInformation("Initializing MediaCapture");
+                   
+                    var cameraDevices = await DeviceInformation.FindAllAsync(DeviceClass.VideoCapture);
+                    DeviceInformation cameraDevice = null;
+
+                    if (cameraType == CameraType.BACK)
+                    {
+                        cameraDevice = cameraDevices.FirstOrDefault(x => x.EnclosureLocation != null && x.EnclosureLocation.Panel == Windows.Devices.Enumeration.Panel.Back);
+                        _logger.LogInformation("Selecting back camera");
+                    }
+                    else
+                    {
+                        cameraDevice = cameraDevices.FirstOrDefault(x => x.EnclosureLocation != null && x.EnclosureLocation.Panel == Windows.Devices.Enumeration.Panel.Front);
+                        _logger.LogInformation("Selecting front camera");
+                    }
+
+                    if (cameraDevice == null)
+                    {
+                        _logger.LogError($"Unable to find {cameraType} camera");
+                        throw new Exception($"Unable to find {cameraType} camera");
+                    }
+
+                    _mediaCapture = new MediaCapture();
+                    var settings = new MediaCaptureInitializationSettings
+                    {
+                        VideoDeviceId = cameraDevice.Id,
+                        //PhotoCaptureSource = PhotoCaptureSource.Photo
+                        //StreamingCaptureMode = StreamingCaptureMode.Video
+                    };
+                    await _mediaCapture.InitializeAsync(settings);
+                    _logger.LogInformation("MediaCapture initialized successfully");
+                }
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError($"Failed to initialize MediaCapture: {ex.Message}");
+                return false;
+            }
+        }
+
+        public async Task<(byte[] imageData, string filePath, string imageFormat)> TakePhotoAsync(FlashMode flashMode, CameraType cameraType, int imageWidth, int imageHeight)
+        {
+            try
+            {
+                _logger.LogInformation($"Taking photo with flash mode: {flashMode}, camera type: {cameraType}, size: {imageWidth}x{imageHeight}");
+                if (!await InitializeAsync(cameraType))
+                    throw new Exception("Failed to initialize camera");
+
+                var videoDeviceController = _mediaCapture.VideoDeviceController;
+                if (videoDeviceController.FlashControl.Supported)
+                {
+                    _logger.LogInformation($"Flash is supported. Setting flash to: {flashMode}");
+                    videoDeviceController.FlashControl.Enabled = flashMode != FlashMode.OFF;
+                    videoDeviceController.FlashControl.Auto = flashMode == FlashMode.AUTO;
+
+                    if (flashMode == FlashMode.ON)
+                    {
+                        videoDeviceController.FlashControl.Enabled = true;
+                        videoDeviceController.FlashControl.Auto = false;
+
+                        // Set flash power to maximum if supported
+                        if (videoDeviceController.FlashControl.PowerSupported)
+                        {
+                            videoDeviceController.FlashControl.PowerPercent = 100;
+                        }
+                    }
+
+                    // Add a small delay to allow the camera to adjust
+                    await Task.Delay(500);
+
+                    // Verify flash state
+                    _logger.LogInformation($"Flash state after setting - Enabled: {videoDeviceController.FlashControl.Enabled}, Auto: {videoDeviceController.FlashControl.Auto}");
+                }
+                else
+                {
+                    _logger.LogWarning("Flash is not supported on this device");
+                }
+
+                var imageEncodingProperties = ImageEncodingProperties.CreateJpeg();
+                imageEncodingProperties.Width = (uint)imageWidth;
+                imageEncodingProperties.Height = (uint)imageHeight;
+
+                // Define the path to save the captured image
+                var folder = await StorageFolder.GetFolderFromPathAsync(
+                    Environment.GetFolderPath(Environment.SpecialFolder.MyPictures));
+                var file = await folder.CreateFileAsync("photo.jpg", CreationCollisionOption.GenerateUniqueName);
+
+                _logger.LogInformation("Capturing photo to storage file");
+                await _mediaCapture.CapturePhotoToStorageFileAsync(imageEncodingProperties, file);
+
+                _logger.LogInformation($"Photo captured and saved to: {file.Path}");
+
+                // Read the file into a byte array using OpenReadAsync
+                byte[] bytes;
+                using (var fileStream = await file.OpenReadAsync())
+                {
+                    bytes = new byte[fileStream.Size];
+                    using (var dataReader = new DataReader(fileStream))
+                    {
+                        await dataReader.LoadAsync((uint)fileStream.Size);
+                        dataReader.ReadBytes(bytes);
+                    }
+                }
+                
+                _logger.LogInformation($"Photo size: {bytes.Length} bytes");
+                Cleanup();
+                return (bytes, file.Path, "jpeg");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError($"Failed to take photo: {ex.Message}");
+                throw;
+            }
+        }
+
+        public void Cleanup()
+        {
+            _logger.LogInformation("Cleaning up MediaCapture");
+            _mediaCapture?.Dispose();
+            _mediaCapture = null;
+        }
+
+        public async Task<(string filePath, string errorMsg)> CapturePhotoUsingNativeCameraAsync()
+        {
+            try
+            {
+                // Launch the native camera app
+                var cameraUri = new Uri("microsoft.windows.camera:");
+                var success = await Launcher.LaunchUriAsync(cameraUri);
+
+                if (!success)
+                {
+                    _logger.LogError("Failed to launch the camera app.");
+                    return (string.Empty, "Failed to launch the camera app.");
+                }
+
+                // Focus the camera app to ensure it's on top
+                var shellUri = new Uri("shell:");
+                await Launcher.LaunchUriAsync(shellUri);
+
+                // Get the Pictures library and log the path
+                var picturesLibrary = await StorageLibrary.GetLibraryAsync(KnownLibraryId.Pictures);
+                var picturesFolder = picturesLibrary.SaveFolder;
+                var cameraRollFolder = await picturesFolder.CreateFolderAsync("Camera Roll", CreationCollisionOption.OpenIfExists);
+
+
+                _logger.LogInformation($"Photos will be saved to: {cameraRollFolder.Path}");
+
+                // Use FileSystemWatcher to detect the new photo in real-time
+                string newFilePath = null;
+                var cancellationTokenSource = new CancellationTokenSource();
+                var watcher = new FileSystemWatcher
+                {
+                    Path = cameraRollFolder.Path,
+                    Filter = "*.jpg",
+                    NotifyFilter = NotifyFilters.FileName | NotifyFilters.CreationTime,
+                    EnableRaisingEvents = true
+                };
+
+                watcher.Created += (sender, e) =>
+                {
+                    newFilePath = e.FullPath;
+                    _logger.LogInformation($"New photo detected: {newFilePath}");
+                    cancellationTokenSource.Cancel(); // Cancel the delay if a new file is detected
+                };
+
+                try
+                {
+                    // Wait for the photo to be captured or timeout after 10 seconds
+                    await Task.Delay(60000, cancellationTokenSource.Token);
+                }
+                catch (TaskCanceledException)
+                {
+                    // Task was cancelled because a new photo was detected
+                }
+                finally
+                {
+                    watcher.EnableRaisingEvents = false;
+                    watcher.Dispose();
+                }
+
+                if (newFilePath != null)
+                {
+                    _logger.LogInformation($"Most recent photo: {newFilePath}");
+                    return (newFilePath, string.Empty);
+                }
+
+                _logger.LogWarning("No new photo detected in the Camera Roll folder.");
+                return (string.Empty, "No new photo detected in the Camera Roll folder.");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError($"An error occurred while capturing the photo: {ex.Message}");
+                return (string.Empty, $"An error occurred while capturing the photo: {ex.Message}");
+            }
+        }
+
+    }
+
+    public enum FlashMode
+    {
+        AUTO,
+        ON,
+        OFF
+    }
+
+    public enum CameraType
+    {
+        BACK,
+        FRONT
+    }
+}
+
+// Program.cs
+using CameraFlashWebAppServer;
+using System.Net.WebSockets;
+using System.Text;
+using System.Collections.Concurrent;
+using System.Text.Json;
+
+var builder = WebApplication.CreateBuilder(args);
+builder.Logging.AddConfiguration(builder.Configuration.GetSection("Logging"));
+builder.Logging.AddConsole();
+
+
+var app = builder.Build();
+var logger = app.Services.GetRequiredService<ILogger<Program>>();
+
+
+// Enable WebSocket support
+var webSocketOptions = new WebSocketOptions()
+{
+    KeepAliveInterval = TimeSpan.FromMinutes(2),
+};
+var connectedClients = new ConcurrentDictionary<string, WebSocket>();
+app.UseWebSockets(webSocketOptions);
+
+// Handle WebSocket connections
+app.Use(async (context, next) =>
+{
+    if (context.Request.Path == "/ws")
+    {
+        if (context.WebSockets.IsWebSocketRequest)
+        {
+            var webSocket = await context.WebSockets.AcceptWebSocketAsync();
+            var clientId = Guid.NewGuid().ToString();
+            connectedClients.TryAdd(clientId, webSocket);
+            logger.LogInformation($"WebSocket connection established for client: {clientId}");
+
+            try
+            {
+                await HandleWebSocketCommunication(context, webSocket, clientId, logger);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError($"Error in WebSocket communication: {ex.Message}");
+            }
+            finally
+            {
+                connectedClients.TryRemove(clientId, out _);
+                logger.LogInformation($"WebSocket connection closed for client: {clientId}");
+            }
+        }
+        else
+        {
+            context.Response.StatusCode = 400;
+        }
+    }
+    else
+    {
+        await next();
+    }
+});
+
+app.Run();
+// Add this after app.Run();
+Console.WriteLine("WebSocket server is running. Press any key to exit.");
+Console.ReadKey();
+
+// Method to handle WebSocket communication
+async Task HandleWebSocketCommunication(HttpContext context, WebSocket webSocket, string clientId, ILogger logger)
+{
+    var buffer = new byte[1024 * 4];
+    WebSocketReceiveResult result = await webSocket.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None);
+
+    var flashController = new FlashControllerApi();
+    flashController.Initialize(logger);
+
+    while (!result.CloseStatus.HasValue)
+    {
+        var message = Encoding.UTF8.GetString(buffer, 0, result.Count);
+        logger.LogInformation($"Received raw message from client {clientId}: {message}");
+
+
+        try
+        {
+            var jsonMessage = JsonSerializer.Deserialize<JsonMessage>(message, new JsonSerializerOptions
+            {
+                PropertyNameCaseInsensitive = true
+            });
+            logger.LogInformation($"Deserialized message - Type: {jsonMessage?.Type}, Command: {jsonMessage?.Command}");
+
+            if (jsonMessage?.Type == "command")
+            {
+                switch (jsonMessage.Command)
+                {
+                    case "TakePhoto":
+                        var photoPath = await TakePhotoAsync(flashController);
+                        await SendJsonResponse(webSocket, new { type = "photo", filePath = photoPath });
+                        break;
+                    case "FlashOn":
+                        await SetFlashMode(flashController, FlashMode.ON);
+                        await SendJsonResponse(webSocket, new { type = "flash", status = "on" });
+                        break;
+                    case "FlashOff":
+                        await SetFlashMode(flashController, FlashMode.OFF);
+                        await SendJsonResponse(webSocket, new { type = "flash", status = "off" });
+                        break;
+                    default:
+                        logger.LogWarning($"Unknown command: {jsonMessage.Command}");
+                        await SendJsonResponse(webSocket, new { type = "error", message = "Unknown command" });
+                        break;
+                }
+            }
+            else
+            {
+                logger.LogWarning($"Unknown command: {jsonMessage.Command}");
+                await SendJsonResponse(webSocket, new { type = "error", message = "Unknown command" });
+            }
+        }
+        catch (System.Text.Json.JsonException jsonEx)
+        {
+            logger.LogError($"Error parsing JSON: {jsonEx.Message}");
+            logger.LogError($"JSON Error details: {jsonEx}");
+            await SendJsonResponse(webSocket, new { type = "error", message = "Invalid JSON format" });
+        }
+        catch (Exception ex)
+        {
+            logger.LogError($"Error processing message: {ex.Message}");
+            await SendJsonResponse(webSocket, new { type = "error", message = "Error processing command" });
+        }
+
+        result = await webSocket.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None);
+    }
+
+    await webSocket.CloseAsync(result.CloseStatus.Value, result.CloseStatusDescription, CancellationToken.None);
+}
+
+// Method to take a photo using the FlashControllerApi
+async Task<string> TakePhotoAsync(FlashControllerApi flashController)
+{
+    var (imageData, filePath, imageFormat) = await flashController.TakePhotoAsync(FlashMode.ON, CameraType.BACK, 1920, 1080);
+    return filePath;
+}
+
+// Method to set flash mode
+async Task SetFlashMode(FlashControllerApi flashController, FlashMode flashMode)
+{
+    await flashController.TakePhotoAsync(flashMode, CameraType.BACK, 1920, 1080); // Use the same API to set the flash mode
+}
+
+async Task SendJsonResponse(WebSocket webSocket, object data)
+{
+    var json = System.Text.Json.JsonSerializer.Serialize(data);
+    var bytes = Encoding.UTF8.GetBytes(json);
+    await webSocket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None);
+}
+
+class JsonMessage
+{
+    public string Type { get; set; }
+    public string Command { get; set; }
+}
+
